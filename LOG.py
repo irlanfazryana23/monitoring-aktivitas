@@ -15,17 +15,44 @@ def convert_df_to_csv(df):
 uploaded_file = st.file_uploader("Upload file Excel (.xlsx)", type=["xlsx"], key="file_uploader")
 
 if uploaded_file:
-    df_original = pd.read_excel(uploaded_file)
-    st.success("✅ File berhasil diupload!")
+    try:
+        df_original = pd.read_excel(uploaded_file)
+        st.success("✅ File berhasil diupload!")
+    except Exception as e:
+        st.error(f"Gagal membaca file Excel: {e}")
+        st.stop()
+
+    # --- FIX: Standarisasi nama kolom untuk menghindari KeyError ---
+    # Mengubah semua nama kolom menjadi uppercase dan menghilangkan spasi
+    try:
+        df_original.columns = [col.strip().upper() for col in df_original.columns]
+    except Exception as e:
+        st.error(f"Gagal memproses nama kolom: {e}")
+        st.stop()
+
+    # Periksa apakah kolom-kolom penting ada
+    required_cols = ['NAMAUSER', 'JAM', 'TANGGAL', 'PROGRAM', 'LOKASI']
+    missing_cols = [col for col in required_cols if col not in df_original.columns]
+
+    if missing_cols:
+        st.error(f"File Excel tidak memiliki kolom yang dibutuhkan: {', '.join(missing_cols)}")
+        st.info(f"Kolom yang terdeteksi setelah standarisasi: {', '.join(df_original.columns)}")
+        st.stop()
+    # --- AKHIR FIX ---
 
     # --- PERSIAPAN & FILTER AWAL ---
     df = df_original.copy()
 
-    df['NAMAUSER'] = df['NAMAUSER'].astype(str)
-    df['JAM_TEXT'] = pd.to_datetime(df['JAM'], format='%H:%M:%S', errors='coerce').dt.strftime('%H:%M:%S')
-    df['JAM'] = pd.to_datetime(df['JAM'], format='%H:%M:%S', errors='coerce').dt.time
-    df['HOUR'] = pd.to_datetime(df['JAM_TEXT'], format='%H:%M:%S', errors='coerce').dt.hour
-    df['TANGGAL'] = pd.to_datetime(df['TANGGAL'], errors='coerce').dt.date
+    try:
+        df['NAMAUSER'] = df['NAMAUSER'].astype(str)
+        df['JAM_TEXT'] = pd.to_datetime(df['JAM'], format='%H:%M:%S', errors='coerce').dt.strftime('%H:%M:%S')
+        df['JAM'] = pd.to_datetime(df['JAM'], format='%H:%M:%S', errors='coerce').dt.time
+        df['HOUR'] = pd.to_datetime(df['JAM_TEXT'], format='%H:%M:%S', errors='coerce').dt.hour
+        df['TANGGAL'] = pd.to_datetime(df['TANGGAL'], errors='coerce').dt.date
+    except Exception as e:
+        st.error(f"Gagal memproses kolom dasar (JAM, TANGGAL, NAMAUSER): {e}")
+        st.info("Pastikan format data di kolom JAM (HH:MM:SS) dan TANGGAL (YYYY-MM-DD atau sejenisnya) sudah benar.")
+        st.stop()
 
     programs_to_exclude = ["MASUK KE SYSTEM", "KELUAR DARI SYSTEM"]
     df = df[~df['PROGRAM'].str.strip().str.upper().isin(programs_to_exclude)]
@@ -37,6 +64,12 @@ if uploaded_file:
 
         min_date = df['TANGGAL'].min()
         max_date = df['TANGGAL'].max()
+
+        # Penanganan jika min_date atau max_date NaT (Not a Time)
+        if pd.isna(min_date) or pd.isna(max_date):
+            st.error("Gagal membaca rentang tanggal. Periksa kolom 'TANGGAL' di file Anda.")
+            st.stop()
+
         selected_date = st.sidebar.date_input("Pilih rentang tanggal:", value=(min_date, max_date), min_value=min_date,
                                               max_value=max_date)
 
@@ -104,15 +137,21 @@ if uploaded_file:
                     with col_tabel:
                         columns_to_drop = ['JAM', 'HOUR']
                         if not show_lokasi:
-                            columns_to_drop.append('LOKASI')
-                        df_display = df_non_edpo.copy().drop(columns=columns_to_drop)
+                            # Hanya drop LOKASI jika ada di dataframe
+                            if 'LOKASI' in df_non_edpo.columns:
+                                columns_to_drop.append('LOKASI')
+
+                        df_display = df_non_edpo.copy().drop(columns=columns_to_drop, errors='ignore')
                         df_display['TANGGAL'] = df_display['TANGGAL'].apply(lambda x: x.strftime('%Y-%m-%d'))
                         kolom_utama = ['NAMAUSER', 'TANGGAL', 'JAM_TEXT', 'PROGRAM']
-                        if show_lokasi:
+                        if show_lokasi and 'LOKASI' in df_non_edpo.columns:
                             kolom_utama.append('LOKASI')
-                        df_display = df_display[kolom_utama]
-                        st.dataframe(df_display)
-                        csv_data = convert_df_to_csv(df_display)
+
+                        # Filter df_display agar hanya menampilkan kolom yang ada
+                        kolom_tampil = [col for col in kolom_utama if col in df_display.columns]
+                        st.dataframe(df_display[kolom_tampil])
+
+                        csv_data = convert_df_to_csv(df_display[kolom_tampil])
                         st.download_button(label="📥 Download Data Tabel Ini (CSV)", data=csv_data,
                                            file_name='log_filtered.csv', mime='text/csv')
                     with col_ringkasan:
@@ -132,24 +171,41 @@ if uploaded_file:
                 selected_user = st.selectbox("Pilih user untuk dianalisis:", opsi_dropdown)
 
                 if selected_user != "-- Pilih User --":
-                    # Ambil semua data harian user yang dipilih
+                    # Ambil semua data harian user yang dipilih dari df_filtered_sidebar (sebelum filter jam 17)
                     user_df = df_filtered_sidebar[df_filtered_sidebar['NAMAUSER'] == selected_user].copy()
-                    user_df = user_df.sort_values(by='JAM_TEXT')
 
-                    # --- Metrik Utama User ---
+                    # --- FIX: Membuat kolom datetime lengkap untuk analisis & sorting ---
+                    # Ini menggabungkan TANGGAL (date) dan JAM (time) menjadi satu timestamp
+                    try:
+                        user_df['DATETIME_LENGKAP'] = user_df.apply(
+                            lambda row: pd.Timestamp.combine(row['TANGGAL'], row['JAM']),
+                            axis=1
+                        )
+                    except Exception as e:
+                        st.error(f"Gagal menggabungkan Tanggal dan Jam untuk user {selected_user}. Error: {e}")
+                        st.stop()
+
+                    # Urutkan berdasarkan DATETIME_LENGKAP
+                    user_df = user_df.sort_values(by='DATETIME_LENGKAP')
+                    # --- AKHIR FIX ---
+
+                    # --- Metrik Utama User (menggunakan DATETIME_LENGKAP) ---
                     st.markdown(f"#### Ringkasan Aktivitas untuk **{selected_user}**")
                     col1, col2, col3, col4 = st.columns(4)
 
-                    aktivitas_pertama = user_df['JAM_TEXT'].min()
-                    aktivitas_terakhir = user_df['JAM_TEXT'].max()
-                    rentang_waktu_td = pd.to_datetime(aktivitas_terakhir) - pd.to_datetime(aktivitas_pertama)
+                    # Ambil aktivitas pertama dan terakhir dari data yang sudah diurutkan
+                    aktivitas_pertama_dt = user_df['DATETIME_LENGKAP'].min()
+                    aktivitas_terakhir_dt = user_df['DATETIME_LENGKAP'].max()
+                    rentang_waktu_td = aktivitas_terakhir_dt - aktivitas_pertama_dt
+
                     # Format rentang waktu menjadi jam dan menit
                     total_menit = rentang_waktu_td.total_seconds() / 60
                     jam, menit = divmod(total_menit, 60)
 
                     col1.metric("Total Aktivitas", len(user_df))
-                    col2.metric("Aktivitas Pertama", aktivitas_pertama)
-                    col3.metric("Aktivitas Terakhir", aktivitas_terakhir)
+                    # Tampilkan format YYYY-MM-DD HH:MM:SS agar jelas jika beda hari
+                    col2.metric("Aktivitas Pertama", aktivitas_pertama_dt.strftime('%Y-%m-%d %H:%M:%S'))
+                    col3.metric("Aktivitas Terakhir", aktivitas_terakhir_dt.strftime('%Y-%m-%d %H:%M:%S'))
                     col4.metric("Rentang Waktu Kerja", f"{int(jam)} jam {int(menit)} mnt")
 
                     st.markdown("---")
@@ -159,28 +215,35 @@ if uploaded_file:
 
                     with col_log:
                         st.subheader("Detail Log Aktivitas Harian")
-                        df_display_user = user_df.copy().drop(['LOKASI', 'JAM', 'HOUR'], axis=1)
+                        # Tampilkan kolom yang relevan, sudah diurutkan
+                        df_display_user = user_df[['NAMAUSER', 'TANGGAL', 'JAM_TEXT', 'PROGRAM']].copy()
                         df_display_user['TANGGAL'] = df_display_user['TANGGAL'].apply(lambda x: x.strftime('%Y-%m-%d'))
-                        st.dataframe(df_display_user[['NAMAUSER', 'TANGGAL', 'JAM_TEXT', 'PROGRAM']])
+                        st.dataframe(df_display_user)
 
                     with col_analisis:
                         # --- Top 5 Program ---
                         st.subheader("Top 5 Program Digunakan")
                         st.dataframe(user_df['PROGRAM'].value_counts().head(5))
 
-                        # --- Waktu Jeda Terlama ---
+                        # --- Waktu Jeda Terlama (menggunakan DATETIME_LENGKAP) ---
                         st.subheader("Top 5 Waktu Jeda Terlama")
-                        user_df['JAM_DATETIME'] = pd.to_datetime(user_df['JAM_TEXT'])
-                        user_df['WAKTU_JEDA'] = user_df['JAM_DATETIME'].diff()
+
+                        # Hitung jeda berdasarkan kolom DATETIME_LENGKAP yang sudah diurutkan
+                        user_df['WAKTU_JEDA'] = user_df['DATETIME_LENGKAP'].diff()
 
                         # Filter jeda di atas 1 menit untuk relevansi
                         df_jeda = user_df[user_df['WAKTU_JEDA'] >
-                            pd.Timedelta(minutes=1)].sort_values(by='WAKTU_JEDA',ascending=False).head(5)
+                                          pd.Timedelta(minutes=1)].sort_values(by='WAKTU_JEDA', ascending=False).head(5)
 
                         # Format untuk tampilan
                         df_jeda['Durasi'] = df_jeda['WAKTU_JEDA'].apply(
-                            lambda x: f"{x.components.hours} jam {x.components.minutes} mnt")
-                        df_jeda_display = df_jeda[['JAM_TEXT', 'Durasi']].rename(
-                            columns={'JAM_TEXT': 'Aktivitas Dimulai Setelah Jeda'})
+                            lambda x: f"{x.components.hours} jam {x.components.minutes} mnt {x.components.seconds} dtk")
+
+                        # Tampilkan waktu *setelah* jeda terjadi
+                        df_jeda['Waktu Mulai'] = df_jeda['DATETIME_LENGKAP'].apply(
+                            lambda x: x.strftime('%Y-%m-%d %H:%M:%S'))
+
+                        df_jeda_display = df_jeda[['Waktu Mulai', 'Durasi']].rename(
+                            columns={'Waktu Mulai': 'Aktivitas Dimulai Setelah Jeda'})
 
                         st.table(df_jeda_display)
